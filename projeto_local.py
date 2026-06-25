@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
+import json
 
 # Configuração da página para celular
 st.set_page_config(page_title="Localizador GPS Renault", layout="wide")
@@ -23,7 +24,7 @@ def carregar_dados():
 df = carregar_dados()
 
 if not df.empty:
-    # --- ÁREA ADMINISTRATIVA (Senha: batata) ---
+    # --- ÁREA ADMINISTRATIVA ---
     st.sidebar.header("🔒 Área Administrativa")
     senha = st.sidebar.text_input("Senha para editar:", type="password")
     if senha == "batata":
@@ -46,141 +47,191 @@ if not df.empty:
             df.to_excel(NOME_ARQUIVO, index=False)
             st.rerun()
 
-    # 2. Barra de busca para filtrar no Radar
-    busca = st.text_input("🔍 Filtrar Equipamento no Radar:", "")
-    if busca:
-        df_filtrado = df[df['Equipamento'].astype(str).str.contains(busca, case=False) | df['Tipo'].astype(str).str.contains(busca, case=False)]
-    else:
-        df_filtrado = df
+    # 2. Barra de busca
+    busca = st.text_input("🔍 Digite o Equipamento ou Tipo para rastrear:", "")
 
-    # 3. Converter dados do Excel para passar para o mapa em JavaScript
-    dados_equipamentos = df_filtrado[['Equipamento', 'Tipo', 'Latitude', 'Longitude']].to_dict(orient='records')
+    # Conversão segura para JSON
+    dados_json = json.dumps(df[['Equipamento', 'Tipo', 'Latitude', 'Longitude']].to_dict(orient='records'))
 
-    # --- INJEÇÃO DO MAPA DE RADAR COM GPS EM TEMPO REAL ---
+    # --- RADAR EM JAVASCRIPT COM ESCALA DINÂMICA ---
     html_radar = f"""
-    <div id="status" style="font-family: sans-serif; font-size:14px; color:#555; margin-bottom:10px;">📡 Aguardando sinal do GPS do celular...</div>
+    <div id="status" style="font-family: sans-serif; font-size:14px; color:#555; margin-bottom:12px;">📡 Inicializando o mapa...</div>
+    <div id="debug" style="font-family: monospace; font-size:12px; color:#2563eb; margin-bottom:10px; font-weight: bold;"></div>
     
-    <div style="margin-bottom: 10px;">
-        <button onclick="mudarZoom(1.5)" style="padding: 8px 15px; font-size: 16px; font-weight: bold; margin-right: 5px; border-radius: 5px; border: 1px solid #ccc; background: white;">➕ Zoom</button>
-        <button onclick="mudarZoom(0.6)" style="padding: 8px 15px; font-size: 16px; font-weight: bold; border-radius: 5px; border: 1px solid #ccc; background: white;">➖ Menos Zoom</button>
+    <div style="margin-bottom: 15px; display: flex; gap: 10px;">
+        <button onclick="mudarZoom(1.5)" style="flex: 1; padding: 12px; font-size: 16px; font-weight: bold; border-radius: 8px; border: 1px solid #cbd5e1; background: #ffffff;">➕ Zoom In</button>
+        <button onclick="mudarZoom(0.6)" style="flex: 1; padding: 12px; font-size: 16px; font-weight: bold; border-radius: 8px; border: 1px solid #cbd5e1; background: #ffffff;">➖ Zoom Out</button>
     </div>
 
-    <canvas id="radarCanvas" style="border:1px solid #ccc; background:#f8f9fa; width:100%; height:450px; border-radius:10px;"></shadow>
+    <canvas id="radarCanvas" style="border:1px solid #cbd5e1; background:#f8f9fa; width:100%; height:450px; border-radius:10px;"></canvas>
 
     <script>
-        const equipamentos = {str(dados_equipamentos)};
+        const equipamentos = {dados_json};
+        const termoBusca = "{busca}".toLowerCase().trim(); 
+        
         const canvas = document.getElementById('radarCanvas');
         const ctx = canvas.getContext('2d');
         const statusDiv = document.getElementById('status');
+        const debugDiv = document.getElementById('debug');
 
-        let ultimaLat = null;
-        let ultimaLon = null;
-
-        // Escala aumentada e calibrada para metros reais dentro do pátio industrial
-        let escala = 450000; 
+        // Ponto central padrão inicial (Renault SJP)
+        let centerLat = -25.541300;
+        let centerLon = -49.183700;
+        let gpsAtivo = false;
+        
+        // Multiplicador de ajuste manual do usuário
+        let modificadorZoom = 1.0; 
 
         function ajustarJanela() {{
             canvas.width = canvas.offsetWidth;
             canvas.height = canvas.offsetHeight;
-            if(ultimaLat !== null) desenharRadar(ultimaLat, ultimaLon);
+            desenharRadar(centerLat, centerLon);
         }}
         window.addEventListener('resize', ajustarJanela);
-        
-        // Inicializa o tamanho
         canvas.width = canvas.offsetWidth;
         canvas.height = canvas.offsetHeight;
 
         function mudarZoom(fator) {{
-            escala = escala * fator;
-            if(ultimaLat !== null) desenharRadar(ultimaLat, ultimaLon);
+            modificadorZoom = modificadorZoom * fator; 
+            desenharRadar(centerLat, centerLon);
         }}
 
-        function desenharRadar(userLat, userLon) {{
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            const centerX = canvas.width / 2;
-            const centerY = canvas.height / 2;
-            
-            // 1. Desenhar anéis concêntricos de distância de referência
-            ctx.strokeStyle = '#e2e8f0';
-            ctx.lineWidth = 1.5;
-            [60, 130, 200, 270].forEach(raio => {{
-                ctx.beginPath();
-                ctx.arc(centerX, centerY, raio, 0, 2 * Math.PI);
-                ctx.stroke();
-            }});
+        function desenharRadar(mapCenterLat, mapCenterLon) {{
+            try {{
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                const centerX = canvas.width / 2;
+                const centerY = canvas.height / 2;
+                
+                // 1. FILTRAR ITENS DA BUSCA ANTES DE TUDO
+                const itensVisiveis = equipamentos.filter(eq => {{
+                    if (termoBusca === "") return true;
+                    const nomeEq = String(eq.Equipamento).toLowerCase();
+                    const tipoEq = String(eq.Tipo).toLowerCase();
+                    return nomeEq.includes(termoBusca) || tipoEq.includes(termoBusca);
+                }});
 
-            // 2. Desenhar os equipamentos do Excel ao redor do usuário
-            equipamentos.forEach(eq => {{
-                // Correção da projeção mercator local (graus para pixels com base no zoom do usuário)
-                const dx = (eq.Longitude - userLon) * escala * Math.cos(userLat * Math.PI / 180);
-                const dy = (userLat - eq.Latitude) * escala; 
+                // 2. CALCULAR ESCALA AUTOMÁTICA PARA FORÇAR OS ITENS A APARECEREM
+                let maxDist = 0.0001; // Valor mínimo para evitar divisão por zero
+                itensVisiveis.forEach(eq => {{
+                    const dLat = Math.abs(eq.Latitude - mapCenterLat);
+                    const dLon = Math.abs(eq.Longitude - mapCenterLon);
+                    if (dLat > maxDist) maxDist = dLat;
+                    if (dLon > maxDist) maxDist = dLon;
+                }});
 
-                const x = centerX + dx;
-                const y = centerY + dy;
+                // Define a escala ideal para que o item mais distante fique na borda do canvas (com margem de 40px)
+                const raioDisponivel = Math.min(centerX, centerY) - 40;
+                let escalaAuto = raioDisponivel / maxDist;
+                
+                // Aplica o zoom manual por cima da escala automática
+                let escalaFinal = escalaAuto * modificadorZoom;
 
-                // Margem de segurança para desenhar o ícone inteiro na borda
-                if (x >= 15 && x <= canvas.width - 15 && y >= 15 && y <= canvas.height - 15) {{
-                    const isImpressora = eq.Tipo.toLowerCase().includes('impressora');
-                    
-                    // Fundo circular do ícone
+                debugDiv.innerHTML = `📊 Exibindo ${{itensVisiveis.length}} itens no radar.`;
+
+                // 3. DESENHAR ANÉIS DO RADAR
+                ctx.strokeStyle = '#e2e8f0';
+                ctx.lineWidth = 1.5;
+                [raioDisponivel * 0.3, raioDisponivel * 0.6, raioDisponivel, raioDisponivel * 1.3].forEach(raio => {{
                     ctx.beginPath();
-                    ctx.arc(x, y, 16, 0, 2 * Math.PI);
-                    ctx.fillStyle = isImpressora ? '#dbeafe' : '#dcfce7';
-                    ctx.strokeStyle = isImpressora ? '#2563eb' : '#16a34a';
-                    ctx.lineWidth = 2.5;
-                    ctx.fill();
+                    ctx.arc(centerX, centerY, raio * modificadorZoom, 0, 2 * Math.PI);
                     ctx.stroke();
+                }});
 
-                    // Emoji correspondente
-                    ctx.font = "16px Arial";
-                    ctx.textAlign = "center";
-                    ctx.textBaseline = "middle";
-                    ctx.fillText(isImpressora ? "🖨️" : "💻", x, y);
+                // 4. DESENHAR OS EQUIPAMENTOS COORDENADOS
+                itensVisiveis.forEach(eq => {{
+                    const tipoEq = String(eq.Tipo).toLowerCase();
 
-                    // Nome em caixa flutuante para facilitar leitura no sol/fábrica
-                    ctx.font = "bold 10px sans-serif";
-                    ctx.fillStyle = "#1e293b";
-                    
-                    // Sombra branca no texto para dar leitura fácil
-                    ctx.strokeStyle = "#ffffff";
-                    ctx.lineWidth = 3;
-                    ctx.strokeText(eq.Equipamento, x, y - 24);
-                    ctx.fillText(eq.Equipamento, x, y - 24);
-                }}
-            }});
+                    // Conversão de coordenadas usando a escala inteligente recalculada
+                    const dx = (eq.Longitude - mapCenterLon) * escalaFinal * Math.cos(mapCenterLat * Math.PI / 180);
+                    const dy = (mapCenterLat - eq.Latitude) * escalaFinal; 
 
-            // 3. Desenhar marcador do Usuário (Bolinha com efeito sonar azul)
-            ctx.beginPath();
-            ctx.arc(centerX, centerY, 9, 0, 2 * Math.PI);
-            ctx.fillStyle = '#2563eb';
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 2.5;
-            ctx.fill();
-            ctx.stroke();
+                    const x = centerX + dx;
+                    const y = centerY + dy;
+
+                    // Apenas desenha se cair dentro da área visível do Canvas
+                    if (x >= 15 && x <= canvas.width - 15 && y >= 15 && y <= canvas.height - 15) {{
+                        const isImpressora = tipoEq.includes('impressora') || tipoEq.includes('imp');
+                        const isComputador = tipoEq.includes('computador') || tipoEq.includes('pc') || tipoEq.includes('comp');
+                        
+                        let corFundo = '#94a3b8'; 
+                        let corBorda = '#64748b';
+                        
+                        if (isComputador) {{
+                            corFundo = '#dcfce7'; 
+                            corBorda = '#16a34a'; 
+                        }} else if (isImpressora) {{
+                            corFundo = '#fef9c3'; 
+                            corBorda = '#ca8a04'; 
+                        }}
+                        
+                        ctx.beginPath();
+                        ctx.arc(x, y, 14, 0, 2 * Math.PI);
+                        ctx.fillStyle = corFundo;
+                        ctx.strokeStyle = corBorda;
+                        ctx.lineWidth = 3;
+                        ctx.fill();
+                        ctx.stroke();
+
+                        ctx.font = "bold 11px sans-serif";
+                        ctx.fillStyle = "#1e293b";
+                        ctx.strokeStyle = "#ffffff";
+                        ctx.lineWidth = 3;
+                        ctx.textAlign = "center";
+                        ctx.strokeText(eq.Equipamento, x, y - 22);
+                        ctx.fillText(eq.Equipamento, x, y - 22);
+                    }}
+                }});
+
+                // 5. MARCADOR CENTRAL (Sua Posição / Fábrica)
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, 8, 0, 2 * Math.PI);
+                ctx.fillStyle = gpsAtivo ? '#2563eb' : '#f59e0b'; 
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2;
+                ctx.fill();
+                ctx.stroke();
+
+            }} catch(e) {{
+                statusDiv.innerHTML = "🔴 Erro ao renderizar mapa: " + e.message;
+            }}
         }}
+
+        desenharRadar(centerLat, centerLon);
 
         if (navigator.geolocation) {{
             navigator.geolocation.watchPosition(
                 (pos) => {{
-                    ultimaLat = pos.coords.latitude;
-                    ultimaLon = pos.coords.longitude;
-                    statusDiv.innerHTML = `🟢 <b>GPS Conectado</b> | Lat: <b>${{ultimaLat.toFixed(6)}}</b> | Lon: <b>${{ultimaLon.toFixed(6)}}</b>`;
-                    desenharRadar(ultimaLat, ultimaLon);
+                    gpsAtivo = true;
+                    centerLat = pos.coords.latitude;
+                    centerLon = pos.coords.longitude;
+                    statusDiv.innerHTML = `🟢 <b>GPS Ativo</b> | Rastreando: "${{termoBusca || 'Todos'}}"`;
+                    desenharRadar(centerLat, centerLon);
                 }},
                 (err) => {{
-                    statusDiv.innerHTML = "🔴 Erro: Por favor, ative a localização/GPS de alta precisão nas configurações do celular.";
+                    gpsAtivo = false;
+                    statusDiv.innerHTML = `⚠️ Visão fixa Renault (Sem GPS) | Rastreando: "${{termoBusca || 'Todos'}}"`;
+                    desenharRadar(centerLat, centerLon);
                 }},
-                {{ enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }}
+                {{ enableHighAccuracy: true, maximumAge: 0, timeout: 6000 }}
             );
         }} else {{
-            statusDiv.innerHTML = "❌ Navegador incompatível com GPS.";
+            statusDiv.innerHTML = "⚠️ Navegador sem suporte a GPS.";
         }}
     </script>
     """
-    
-    components.html(html_radar, height=520)
+    components.html(html_radar, height=550)
 
-    # Tabela de conferência
-    st.subheader(f"Lista de Equipamentos ({len(df_filtrado)})")
-    st.dataframe(df_filtrado[['Equipamento', 'Tipo', 'Latitude', 'Longitude']], width="stretch")
+    st.markdown("### 🗺️ Legenda do Radar")
+    col1, col2, col3 = st.columns(3)
+    with col1: st.markdown("🟢 **Bolinha Verde:** Computadores / PCs")
+    with col2: st.markdown("🟡 **Bolinha Amarela:** Impressoras")
+    with col3: st.markdown("🔵 **Bolinha Azul:** Você (Sua posição atual via GPS)")
+
+    if busca:
+        df_tabela = df[df['Equipamento'].astype(str).str.contains(busca, case=False) | df['Tipo'].astype(str).str.contains(busca, case=False)]
+    else:
+        df_tabela = df
+
+    st.markdown("---")
+    st.subheader(f"Lista de Equipamentos Cadastrados ({len(df_tabela)})")
+    st.dataframe(df_tabela[['Equipamento', 'Tipo', 'Latitude', 'Longitude']], width="stretch")
